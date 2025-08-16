@@ -147,47 +147,222 @@ from __future__ import annotations
 import cmath, math
 from typing import List, Sequence
 
+############################################################
+# RECURSIVE FFT (COOLEY–TUKEY) – FULLY ANNOTATED VERSION   #
+############################################################
+# Representation:
+#   A polynomial a(x) = a0 + a1 x + ... + a_{n-1} x^{n-1}
+#   is represented by a Python list a = [a0, a1, ..., a_{n-1}].
+#
+# Goal:
+#   Efficiently compute the Discrete Fourier Transform (DFT)
+#   values A_k = sum_{j=0}^{n-1} a_j * omega^{j k}, where omega = e^{2πi/n}.
+#   The recursive FFT reduces O(n^2) to O(n log n) by splitting into
+#   even / odd indices and reusing the (n/2)-size transforms.
+#
+# invert=False  -> forward FFT
+# invert=True   -> inverse FFT (complex conjugate / divide by 2 at each merge)
+#
+# In-place strategy:
+#   The list 'a' is *overwritten* with its DFT values (or inverse) to avoid
+#   allocating large temporary arrays at every recursion layer.
+
 def _fft(a: List[complex], invert: bool = False) -> None:
+    """In-place recursive FFT.
+
+    Args:
+        a: list of complex numbers (length must be a power of two)
+        invert: if True, performs inverse FFT.
+
+    Side-effects:
+        Mutates 'a' to contain its forward (or inverse) DFT.
+    """
     n = len(a)
+    # Base case: length-1 list is already its own DFT.
     if n == 1:
         return
-    even = a[0::2]
-    odd = a[1::2]
+
+    # Split into even-indexed and odd-indexed parts (stride slicing).
+    even = a[0::2]          # elements a[0], a[2], a[4], ...
+    odd = a[1::2]           # elements a[1], a[3], a[5], ...
+
+    # Recurse on halves (each of size n/2).
     _fft(even, invert)
     _fft(odd, invert)
+
+    # Fundamental n-th root of unity (direction depends on forward/inverse).
+    # For inverse we use exp(-2πi / n), for forward exp(+2πi / n) *BUT*
+    # we incorporate the sign by flipping with ( -1 if invert else 1 ).
     ang = (2 * math.pi / n) * (-1 if invert else 1)
-    w = 1+0j
-    wn = cmath.exp(1j * ang)
-    for k in range(n // 2):
+    wn = cmath.exp(1j * ang)  # principal root
+    w = 1 + 0j                # current power of wn
+
+    # Merge step: combine results from even & odd parts.
+    half = n // 2
+    for k in range(half):
+        # u = contribution from even part
         u = even[k]
+        # v = contribution from odd part multiplied by current twiddle factor
         v = odd[k] * w
+        # a[k]      = E_k + w^k * O_k
         a[k] = u + v
-        a[k + n//2] = u - v
+        # a[k+half] = E_k - w^k * O_k   (symmetry exploiting ω^{k+ n/2} = -ω^k)
+        a[k + half] = u - v
+        # For inverse FFT we normalize *gradually* to avoid a later full pass.
         if invert:
             a[k] /= 2
-            a[k + n//2] /= 2
+            a[k + half] /= 2
+        # Advance twiddle factor: w := w * wn
         w *= wn
 
+############################################################
+# POLYNOMIAL MULTIPLICATION USING FFT                       #
+############################################################
 def multiply_polynomials(A: Sequence[float], B: Sequence[float]) -> List[float]:
+    """Multiply two real-coefficient polynomials using FFT.
+
+    Given A (length n) and B (length m):
+        Result length = n + m - 1.
+    Steps:
+        1. Choose power-of-two N >= n + m - 1.
+        2. Zero-pad A and B to length N.
+        3. Forward FFT both arrays.
+        4. Pointwise multiply spectra.
+        5. Inverse FFT the product spectrum.
+        6. Extract real parts (round tiny floating noise) of first (n+m-1) terms.
+    """
     n, m = len(A), len(B)
-    need = n + m - 1
+    need = n + m - 1              # number of coefficients in product
+
+    # Small optimization: handle trivial cases early.
+    if n == 0 or m == 0:
+        return []
+    if n == 1:
+        return [A[0] * b for b in B]
+    if m == 1:
+        return [B[0] * a for a in A]
+
+    # Find smallest power of two >= need.
     N = 1
     while N < need:
         N <<= 1
-    fa = list(map(complex, A)) + [0j]*(N - n)
-    fb = list(map(complex, B)) + [0j]*(N - m)
-    _fft(fa, False)
-    _fft(fb, False)
+
+    # Prepare complex copies padded with zeros.
+    fa = list(map(complex, A)) + [0j] * (N - n)
+    fb = list(map(complex, B)) + [0j] * (N - m)
+
+    # Forward FFT both lists.
+    _fft(fa, invert=False)
+    _fft(fb, invert=False)
+
+    # Pointwise multiply: corresponds to convolution in coefficient space.
     for i in range(N):
         fa[i] *= fb[i]
-    _fft(fa, True)
-    return [float(round(fa[i].real, 12)) for i in range(need)]
 
+    # Inverse FFT to interpolate coefficients back.
+    _fft(fa, invert=True)
+
+    # Extract real parts (imag part should be ~0; rounding removes noise).
+    result = [float(round(fa[i].real, 12)) for i in range(need)]
+    return result
+
+############################################################
+# NAIVE REFERENCE (O(n*m)) FOR VALIDATION                  #
+############################################################
+def multiply_polynomials_naive(A: Sequence[float], B: Sequence[float]) -> List[float]:
+    """Quadratic-time convolution for cross-checking correctness."""
+    if not A or not B:
+        return []
+    res = [0.0] * (len(A) + len(B) - 1)
+    for i, a in enumerate(A):
+        for j, b in enumerate(B):
+            res[i + j] += a * b
+    return res
+
+############################################################
+# DEMONSTRATION / SELF-TEST                                #
+############################################################
 if __name__ == "__main__":
-    A = [3, 2, 5]
-    B = [5, 1, 2, 3]
-    print(multiply_polynomials(A, B))  # [15.0, 13.0, 33.0, 18.0, 16.0, 15.0]
+    # Example from the worked section:
+    A = [3, 2, 5]                # 3 + 2x + 5x^2
+    B = [5, 1, 2, 3]             # 5 + 1x + 2x^2 + 3x^3
+
+    fft_product = multiply_polynomials(A, B)
+    naive_product = multiply_polynomials_naive(A, B)
+
+    print("FFT product   :", fft_product)
+    print("Naive product :", naive_product)
+    print("Match?", fft_product == naive_product)
+
+    # Additional edge cases:
+    print("Single-term * poly:", multiply_polynomials([7], [1, -4, 3]))
+    print("Zero poly:", multiply_polynomials([], []))
+    print("Negative coefficients:", multiply_polynomials([1, -2, 3], [-1, 4]))
+
+    # Large random test (optional quick sanity) – commented out to keep deterministic output.
+    # import random
+    # X = [random.randint(-5,5) for _ in range(16)]
+    # Y = [random.randint(-5,5) for _ in range(16)]
+    # assert multiply_polynomials(X, Y) == multiply_polynomials_naive(X, Y)
+    # print("Random test passed!")
 ```
+
+### Line-by-Line Highlights
+
+| Code Fragment                   | Explanation                                                         |
+| ------------------------------- | ------------------------------------------------------------------- |
+| `even = a[0::2]`                | Takes all even-indexed coefficients (recursively represent P_even). |
+| `odd = a[1::2]`                 | Takes all odd-indexed coefficients (recursively represent P_odd).   |
+| `ang = (2*pi/n)*(...)`          | Angle for primitive n-th root. Sign flips for inverse.              |
+| `wn = exp(i*ang)`               | Principal root; successive powers multiply by `wn`.                 |
+| Loop `for k in range(n//2)`     | Combine size-n/2 FFTs for even/odd to size-n FFT.                   |
+| `a[k] = u+v`, `a[k+half] = u-v` | Butterfly operation exploiting symmetry.                            |
+| Inverse branch divides by 2     | Deferred normalization so total factor becomes 1/n.                 |
+| Pointwise multiply spectra      | Implements convolution theorem.                                     |
+| Round to 12 decimals            | Removes small floating noise (e.g. -1e-13).                         |
+
+### Correctness Sanity Checks
+
+1. Length of result = `len(A)+len(B)-1`.
+2. Leading zeros naturally appear if highest-degree terms cancel; we keep them unless trimming is desired.
+3. Naive vs FFT method comparison ensures implementation integrity.
+
+### Edge Cases Discussed
+
+| Scenario                   | Behavior                                            |
+| -------------------------- | --------------------------------------------------- |
+| One operand empty          | Returns empty list.                                 |
+| Single coefficient \* poly | Scales the polynomial.                              |
+| Negative coefficients      | Handled seamlessly (complex arithmetic unaffected). |
+| Floating inputs            | Works; output rounding mitigates precision noise.   |
+
+### Complexity Recap
+
+Let `N` be the power-of-two padding length. The recursion satisfies:
+`T(N) = 2 T(N/2) + O(N)` → `T(N) = O(N log N)`.
+Pointwise multiply adds O(N). Overall O(N log N). Space O(N) excluding recursion stack.
+
+### When to Prefer Other Methods
+
+| Input Size                        | Recommended Method                 |
+| --------------------------------- | ---------------------------------- |
+| Very small (N < ~32)              | Naive convolution (lower constant) |
+| Medium floating point             | FFT as above                       |
+| Large integer (exact)             | Number Theoretic Transform (NTT)   |
+| Arbitrary length non-power-of-two | Bluestein or mixed-radix FFT       |
+
+### Practical Tips
+
+- For production, use an iterative bit-reversal FFT to reduce allocations.
+- For integer multiplication, choose modulus primes supporting required roots (NTT).
+- To reduce floating error, optionally use double padding and Kahan summation (rarely needed here).
+- Post-processing: optionally strip trailing ~0 coefficients: `while res and abs(res[-1])<1e-12: res.pop()`.
+
+### Mini Verification Example (Manual)
+
+Take A(x)=1+2x, B(x)=1+3x+4x^2. Product should be:
+`(1)(1) + (1)(3)+(2)(1) x + (1)(4)+(2)(3) x^2 + (2)(4) x^3 = 1 + 5x + 10x^2 + 8x^3`.
+`multiply_polynomials([1,2],[1,3,4]) -> [1.0, 5.0, 10.0, 8.0]`.
 
 ---
 
